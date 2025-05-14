@@ -1,21 +1,10 @@
 const StompJs = require("@stomp/stompjs");
 const config = require("./config.js");
 
-class Train {
-  constructor(id, name, lat, lon, color, departurePlace, destinationPlace) {
-    this.id = id;
-    this.name = name;
-    this.lat = lat;
-    this.lon = lon;
-    this.color = color;
-    this.departurePlace = departurePlace;
-    this.destinationPlace = destinationPlace;
-  }
-}
-
 class TrainSimulator {
   constructor() {
     this.trains = [];
+    this.metadataSentTrains = new Set();
 
     this.client = null;
     this.isConnected = false;
@@ -38,11 +27,12 @@ class TrainSimulator {
       onWebSocketError: this.handleWebSocketError.bind(this),
     });
   }
-
   handleConnect() {
     console.log("Connected to WebSocket server");
     this.isConnected = true;
     this.reconnectAttempts = 0;
+    // Reset the metadata tracking when reconnecting
+    this.metadataSentTrains = new Set();
 
     // Fetch trains from the backend first, then subscribe to topics and start simulation
     this.getAlltrains()
@@ -138,11 +128,25 @@ class TrainSimulator {
     // Also subscribe to the trains topic for bulk updates
     this.client.subscribe("/topic/trains", this.handleTrainsMessage.bind(this));
   }
-
   handleLocationMessage(message) {
     try {
       const location = JSON.parse(message.body);
-      console.log("Current train location:", location);
+
+      // Find the train in our trains array to get missing data if needed
+      const trainId = location.id;
+      const existingTrain = this.trains.find((t) => t.id === trainId);
+
+      console.log({
+        id: trainId,
+        lat: location.lat,
+        lon: location.lon,
+      });
+
+      // Update our local train data if needed
+      if (existingTrain) {
+        existingTrain.lat = location.lat;
+        existingTrain.lon = location.lon;
+      }
     } catch (error) {
       console.error("Error parsing location message:", error);
     }
@@ -176,7 +180,6 @@ class TrainSimulator {
       this.sendAllTrains();
     }, 2000);
   }
-
   moveTrain(train) {
     if (!this.isConnected) return;
 
@@ -191,7 +194,12 @@ class TrainSimulator {
     train.lat += latChange;
     train.lon += lonChange;
 
-    this.sendLocation(train);
+    // Check if we've already sent the full data for this train
+    if (!this.metadataSentTrains.has(train.id)) {
+      this.sendFullTrainData(train);
+    } else {
+      this.sendLocationOnly(train);
+    }
   }
 
   sendAllTrains() {
@@ -206,7 +214,6 @@ class TrainSimulator {
       console.error("Error sending all trains:", error);
     }
   }
-
   sendLocation(train) {
     try {
       this.client.publish({
@@ -224,6 +231,51 @@ class TrainSimulator {
       });
     } catch (error) {
       console.error("Error sending location:", error);
+    }
+  }
+
+  // Send full train data including metadata (only used once per train)
+  sendFullTrainData(train) {
+    try {
+      this.client.publish({
+        destination: "/app/locate",
+        body: JSON.stringify({
+          id: train.id,
+          name: train.name,
+          color: train.color,
+          departurePlace: train.departurePlace,
+          destinationPlace: train.destinationPlace,
+          // Add a flag to indicate this is the full metadata
+          isMetadata: true,
+          timestamp: new Date().toISOString(),
+        }),
+      });
+
+      // Mark this train as having had its metadata sent
+      this.metadataSentTrains.add(train.id);
+      console.log(`Sent metadata for train ${train.name} (${train.id})`);
+
+      // Now send the initial location
+      this.sendLocationOnly(train);
+    } catch (error) {
+      console.error("Error sending full train data:", error);
+    }
+  }
+
+  // Send only location updates (used after metadata has been sent)
+  sendLocationOnly(train) {
+    try {
+      this.client.publish({
+        destination: "/app/locate",
+        body: JSON.stringify({
+          id: train.id,
+          lat: train.lat,
+          lon: train.lon,
+          timestamp: new Date().toISOString(),
+        }),
+      });
+    } catch (error) {
+      console.error("Error sending location update:", error);
     }
   }
 
